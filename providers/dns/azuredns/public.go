@@ -13,6 +13,8 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/dns/armdns"
 	"github.com/go-acme/lego/v4/challenge/dns01"
+	"github.com/go-acme/lego/v4/log"
+	"github.com/miekg/dns"
 )
 
 // DNSProviderPublic implements the challenge.Provider interface for Azure Public Zone DNS.
@@ -57,9 +59,17 @@ func (d *DNSProviderPublic) Present(domain, _, keyAuth string) error {
 		return fmt.Errorf("azuredns: %w", err)
 	}
 
-	subDomain, err := dns01.ExtractSubDomain(info.EffectiveFQDN, zone.Name)
-	if err != nil {
-		return fmt.Errorf("azuredns: %w", err)
+	canonDomain := dns.Fqdn(info.EffectiveFQDN)
+	canonZone := dns.Fqdn(zone.Name)
+	log.Infof("Public Canon Domain [%s] Canon Zone [%s]", canonDomain, canonZone)
+	var subDomain string
+	if canonDomain == canonZone {
+		subDomain = "@"
+	} else {
+		subDomain, err = dns01.ExtractSubDomain(info.EffectiveFQDN, zone.Name)
+		if err != nil {
+			return fmt.Errorf("azuredns: %w", err)
+		}
 	}
 
 	// Get existing record set
@@ -109,14 +119,54 @@ func (d *DNSProviderPublic) CleanUp(domain, _, keyAuth string) error {
 		return fmt.Errorf("azuredns: %w", err)
 	}
 
-	subDomain, err := dns01.ExtractSubDomain(info.EffectiveFQDN, zone.Name)
-	if err != nil {
-		return fmt.Errorf("azuredns: %w", err)
+	canonDomain := dns.Fqdn(info.EffectiveFQDN)
+	canonZone := dns.Fqdn(zone.Name)
+	log.Infof("Delete TXT Public Canon Domain [%s] Canon Zone [%s]", canonDomain, canonZone)
+	var subDomain string
+	if canonDomain == canonZone {
+		subDomain = "@"
+	} else {
+		subDomain, err = dns01.ExtractSubDomain(info.EffectiveFQDN, zone.Name)
+		if err != nil {
+			return fmt.Errorf("azuredns: %w", err)
+		}
 	}
 
-	_, err = client.Delete(ctx, subDomain)
+	resp, err := client.Get(ctx, subDomain)
 	if err != nil {
-		return fmt.Errorf("azuredns: %w", err)
+		var respErr *azcore.ResponseError
+		if !errors.As(err, &respErr) || respErr.StatusCode != http.StatusNotFound {
+			return fmt.Errorf("azuredns: %w", err)
+		}
+	}
+
+	uniqRecords := publicUniqueRecordsRemove(resp.RecordSet, info.Value)
+
+	if len(uniqRecords) > 0 {
+		log.Infof("Removing TXT record from Domain [%s] but leaving recordset as it isn't empty", canonDomain)
+		var txtRecords []*armdns.TxtRecord
+		for txt := range uniqRecords {
+			txtRecords = append(txtRecords, &armdns.TxtRecord{Value: to.SliceOfPtrs(txt)})
+		}
+
+		rec := armdns.RecordSet{
+			Name: &subDomain,
+			Properties: &armdns.RecordSetProperties{
+				TTL:        to.Ptr(int64(d.config.TTL)),
+				TxtRecords: txtRecords,
+			},
+		}
+
+		_, err = client.CreateOrUpdate(ctx, subDomain, rec)
+		if err != nil {
+			return fmt.Errorf("azuredns: %w", err)
+		}
+	} else {
+		log.Infof("Delete TXT recordset for [%s] as it is empty", canonDomain)
+		_, err = client.Delete(ctx, subDomain)
+		if err != nil {
+			return fmt.Errorf("azuredns: %w", err)
+		}
 	}
 
 	return nil
@@ -179,6 +229,21 @@ func publicUniqueRecords(recordSet armdns.RecordSet, value string) map[string]st
 		for _, txtRecord := range recordSet.Properties.TxtRecords {
 			// Assume Value doesn't contain multiple strings
 			if len(txtRecord.Value) > 0 {
+				uniqRecords[deref(txtRecord.Value[0])] = struct{}{}
+			}
+		}
+	}
+
+	return uniqRecords
+}
+
+func publicUniqueRecordsRemove(recordSet armdns.RecordSet, valueToRemove string) map[string]struct{} {
+	uniqRecords := map[string]struct{}{}
+
+	if recordSet.Properties != nil && recordSet.Properties.TxtRecords != nil {
+		for _, txtRecord := range recordSet.Properties.TxtRecords {
+			// Assume Value doesn't contain multiple strings
+			if len(txtRecord.Value) > 0 && *txtRecord.Value[0] != valueToRemove {
 				uniqRecords[deref(txtRecord.Value[0])] = struct{}{}
 			}
 		}
